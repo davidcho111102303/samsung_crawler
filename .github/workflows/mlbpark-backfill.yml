@@ -1,0 +1,93 @@
+name: MLBPARK Samsung Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: Start date, inclusive
+        required: true
+        default: "2024-01-01"
+      end_date:
+        description: End date, inclusive
+        required: true
+        default: "2026-08-12"
+      keywords:
+        description: Space-separated keywords
+        required: true
+        default: "삼전 삼성전자 반도체 삼성"
+      max_search_pages:
+        description: Max MLBPARK search pages per keyword
+        required: true
+        default: "900"
+      delay:
+        description: Base delay seconds
+        required: true
+        default: "1.8"
+      jitter:
+        description: Random extra delay seconds
+        required: true
+        default: "2.2"
+  schedule:
+    # Small nightly catch-up. Manual workflow_dispatch is recommended for heavy backfill.
+    - cron: "30 18 * * *"
+
+concurrency:
+  group: mlbpark-samsung-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run MLBPARK crawler
+        run: |
+          mkdir -p outputs
+          START_DATE="${{ github.event.inputs.start_date || '2024-01-01' }}"
+          END_DATE="${{ github.event.inputs.end_date || '2026-08-12' }}"
+          KEYWORDS="${{ github.event.inputs.keywords || '삼전 삼성전자 반도체 삼성' }}"
+          MAX_SEARCH_PAGES="${{ github.event.inputs.max_search_pages || '900' }}"
+          DELAY="${{ github.event.inputs.delay || '2.0' }}"
+          JITTER="${{ github.event.inputs.jitter || '3.0' }}"
+
+          python scripts/mlbpark_scrapling_collect.py \
+            --db outputs/mlbpark-progress.sqlite \
+            --jsonl outputs/mlbpark-posts.jsonl \
+            --start-date "$START_DATE" \
+            --end-date "$END_DATE" \
+            --keywords $KEYWORDS \
+            --max-search-pages "$MAX_SEARCH_PAGES" \
+            --delay "$DELAY" \
+            --jitter "$JITTER" \
+            --timeout 30 \
+            --retries 3 \
+            --backoff 30 \
+            --stop-after-older-pages 4 \
+            --supabase-storage-bucket mlbpark-raw \
+            --supabase-storage-prefix mlbpark/samsung \
+            --no-local-raw-html
+
+      - name: Upload progress artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlbpark-progress
+          path: |
+            outputs/mlbpark-progress.sqlite
+            outputs/mlbpark-posts.jsonl
+          retention-days: 7
