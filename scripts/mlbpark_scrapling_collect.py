@@ -132,7 +132,7 @@ def fetch(url, timeout, retries=3, backoff=15.0):
             print(f"backoff error={exc!r} attempt={attempt}/{retries} wait={wait:.1f}s url={url}")
             time.sleep(wait)
     if last_exc:
-        raise last_exc
+        raise RuntimeError(f"fetch failed after retries url={url} error={last_exc!r}") from last_exc
     raise RuntimeError(f"fetch failed after retries url={url}")
 
 
@@ -592,15 +592,19 @@ def main():
 
     candidates = {}
     for keyword in args.keywords:
-        found, discovery_rows = discover(
-            keyword,
-            args.max_search_pages,
-            args.timeout,
-            args.delay,
-            jitter=args.jitter,
-            start_date=start_date,
-            stop_after_older_pages=args.stop_after_older_pages,
-        )
+        try:
+            found, discovery_rows = discover(
+                keyword,
+                args.max_search_pages,
+                args.timeout,
+                args.delay,
+                jitter=args.jitter,
+                start_date=start_date,
+                stop_after_older_pages=args.stop_after_older_pages,
+            )
+        except RuntimeError as exc:
+            print(f"Network error during discovery for keyword {keyword}: {exc}")
+            continue
         if supabase:
             supabase.upsert("mlbpark_discoveries", discovery_rows, "keyword,search_url,post_id")
         for post_id, url in found.items():
