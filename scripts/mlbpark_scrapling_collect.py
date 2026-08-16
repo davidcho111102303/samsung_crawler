@@ -91,12 +91,23 @@ def ensure_schema(conn):
           status integer,
           error text
         );
+        create table if not exists discovery_progress (
+          keyword text primary key,
+          last_page_scanned integer not null default 0,
+          updated_at text not null
+        );
         """
     )
     ensure_column(conn, "posts", "raw_html_r2_key", "text")
     ensure_column(conn, "posts", "raw_html_storage_path", "text")
     ensure_column(conn, "comments", "raw_html_r2_key", "text")
     ensure_column(conn, "comments", "raw_html_storage_path", "text")
+    ensure_column(conn, "discoveries", "status", "text default 'discovered'")
+    ensure_column(conn, "discoveries", "post_status", "text")
+    ensure_column(conn, "discoveries", "comment_status", "text")
+    ensure_column(conn, "discoveries", "claimed_at", "text")
+    ensure_column(conn, "discoveries", "attempt_count", "integer default 0")
+    ensure_column(conn, "discoveries", "last_error", "text")
     conn.commit()
 
 
@@ -145,17 +156,23 @@ def date_from_post_id(post_id):
         return None
 
 
-def discover(keyword, max_pages, timeout, delay, jitter=0.0, start_date=None, stop_after_older_pages=3):
-    seen = {}
-    discoveries = []
+def discover(conn, supabase, keyword, max_pages, timeout, delay, jitter=0.0, start_date=None, stop_after_older_pages=3):
     encoded = quote_plus(keyword)
     older_page_streak = 0
-    for page_index in range(max_pages):
+    
+    cur = conn.execute("SELECT last_page_scanned FROM discovery_progress WHERE keyword = ?", (keyword,))
+    row = cur.fetchone()
+    last_page = row[0] if row else 0
+    start_page = max(0, last_page - 5)
+    
+    for page_index in range(start_page, max_pages):
         offset = page_index * 30 + 1
         url = f"{BASE}?p={offset}&m=search&b=bullpen&query={encoded}&select=sct&user="
         page = fetch(url, timeout)
         links = page.css("td.t_left a::attr(href)").get_all()
         page_dates = []
+        
+        discovery_rows = []
         for href in links:
             full = urljoin(BASE, href)
             post_id = post_id_from_url(full)
@@ -163,15 +180,37 @@ def discover(keyword, max_pages, timeout, delay, jitter=0.0, start_date=None, st
                 post_date = date_from_post_id(post_id)
                 if post_date:
                     page_dates.append(post_date)
-                seen[post_id] = full
-                discoveries.append(
-                    {
-                        "keyword": keyword,
-                        "search_url": url,
-                        "post_id": post_id,
-                        "discovered_at": now_iso(),
-                    }
+                
+                conn.execute(
+                    """
+                    INSERT INTO discoveries 
+                    (keyword, search_url, post_id, discovered_at, status, attempt_count) 
+                    VALUES (?, ?, ?, ?, 'discovered', 0)
+                    ON CONFLICT(keyword, search_url, post_id) DO NOTHING
+                    """,
+                    (keyword, url, post_id, now_iso())
                 )
+                discovery_rows.append({
+                    "keyword": keyword,
+                    "search_url": url,
+                    "post_id": post_id,
+                    "discovered_at": now_iso()
+                })
+                
+        if supabase and discovery_rows:
+            try:
+                supabase.upsert("mlbpark_discoveries", discovery_rows, "keyword,search_url,post_id")
+            except Exception as e:
+                print(f"Warning: Supabase discovery log failed: {e}")
+                
+        conn.execute(
+            "INSERT INTO discovery_progress (keyword, last_page_scanned, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(keyword) DO UPDATE SET last_page_scanned = excluded.last_page_scanned, updated_at = excluded.updated_at",
+            (keyword, page_index, now_iso())
+        )
+        conn.commit()
+        print(f"Discovery: keyword={keyword} page={page_index} offset={offset} found={len(discovery_rows)}")
+        
         if start_date and page_dates and max(page_dates) < start_date:
             older_page_streak += 1
             if older_page_streak >= stop_after_older_pages:
@@ -180,7 +219,6 @@ def discover(keyword, max_pages, timeout, delay, jitter=0.0, start_date=None, st
         else:
             older_page_streak = 0
         polite_sleep(delay, jitter)
-    return seen, discoveries
 
 
 def extract_post(page, url, keywords):
@@ -590,10 +628,12 @@ def main():
     start_date = dt.date.fromisoformat(args.start_date)
     end_date = dt.date.fromisoformat(args.end_date)
 
-    candidates = {}
+    # 1. 탐색 페이즈 (Discovery Queueing)
     for keyword in args.keywords:
         try:
-            found, discovery_rows = discover(
+            discover(
+                conn,
+                supabase,
                 keyword,
                 args.max_search_pages,
                 args.timeout,
@@ -605,18 +645,23 @@ def main():
         except RuntimeError as exc:
             print(f"Network error during discovery for keyword {keyword}: {exc}")
             continue
-        if supabase:
-            supabase.upsert("mlbpark_discoveries", discovery_rows, "keyword,search_url,post_id")
-        for post_id, url in found.items():
-            candidates.setdefault(post_id, {"url": url, "keywords": set()})
-            candidates[post_id]["keywords"].add(keyword)
-            conn.execute(
-                "insert or ignore into discoveries values (?, ?, ?, ?)",
-                (keyword, url, post_id, now_iso()),
-            )
-        conn.commit()
 
-    items = list(candidates.items())
+    # 2. 작업 큐 가져오기 (Worker Phase)
+    # status='discovered' 이거나 처리된 지 15분 지난 'processing' (Stale)
+    stale_threshold = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
+    cur = conn.execute(
+        """
+        SELECT post_id, MAX(search_url), GROUP_CONCAT(keyword)
+        FROM discoveries
+        WHERE status = 'discovered' OR (status = 'processing' AND claimed_at < ?)
+        GROUP BY post_id
+        """,
+        (stale_threshold,)
+    )
+    items = []
+    for row in cur.fetchall():
+        items.append((row[0], {"url": row[1], "keywords": set(row[2].split(","))}))
+        
     if args.limit_posts:
         items = items[: args.limit_posts]
 
@@ -634,8 +679,19 @@ def main():
     
     consecutive_network_errors = 0
 
+    start_time = time.time()
     try:
         for index, (post_id, info) in enumerate(items, start=1):
+            if time.time() - start_time > 19800:  # 5.5 hours = 5.5 * 3600 = 19800 seconds
+                print("Graceful Shutdown: 5.5 hours elapsed. Checkpointing and exiting cleanly.")
+                break
+                
+            conn.execute(
+                "UPDATE discoveries SET status = 'processing', claimed_at = ? WHERE post_id = ?",
+                (now_iso(), post_id)
+            )
+            conn.commit()
+
             try:
                 # 1. FETCH & POST PARSE
                 try:
@@ -645,6 +701,17 @@ def main():
                 except RuntimeError as exc:
                     print(f"Network error on {info['url']}: {exc}")
                     consecutive_network_errors += 1
+                    
+                    conn.execute(
+                        "UPDATE discoveries SET attempt_count = attempt_count + 1, last_error = ? WHERE post_id = ?",
+                        (str(exc), post_id)
+                    )
+                    conn.execute(
+                        "UPDATE discoveries SET status = CASE WHEN attempt_count >= 3 THEN 'failed' ELSE 'discovered' END WHERE post_id = ?",
+                        (post_id,)
+                    )
+                    conn.commit()
+
                     if consecutive_network_errors >= 5:
                         raise SystemExit(f"Circuit Breaker triggered: 5 consecutive network errors. Exiting.")
                     polite_sleep(args.delay, args.jitter)
@@ -655,8 +722,14 @@ def main():
                 
                 if not in_date_range(post, start_date, end_date):
                     print(f"skip post_id={post_id} created_at={post.get('created_at')}")
+                    conn.execute(
+                        "UPDATE discoveries SET status = 'done', post_status = 'skipped_date', attempt_count = attempt_count + 1 WHERE post_id = ?",
+                        (post_id,)
+                    )
+                    conn.commit()
                     polite_sleep(args.delay, args.jitter)
                     continue
+                    
                 post["matched_keywords"] = json.dumps(sorted(info["keywords"]), ensure_ascii=False)
 
                 # 2. SAVE POST FIRST (SQLite first, then Cloud)
@@ -665,7 +738,6 @@ def main():
                     post["content_html"] = None
                     
                 upsert_post(conn, post)
-                
                 upload_raw_to_r2(r2, post)
                 upload_raw_to_supabase_storage(supabase_storage, post)
                 upsert_supabase_post(supabase, post)
@@ -674,6 +746,7 @@ def main():
                 
                 # 3. PARSE & SAVE COMMENTS
                 comments = []
+                comment_status = 'done'
                 try:
                     comments = extract_comments(page, post_id)
                     stats["comment_parsed"] += len(comments)
@@ -690,6 +763,7 @@ def main():
                         stats["comment_saved"] += len(comments)
                 except Exception as exc:
                     stats["comment_failed"] += 1
+                    comment_status = 'failed'
                     import traceback
                     traceback.print_exc()
                     print(f"Warning: Failed to parse/save comments for post_id={post_id} (Post was saved). Error: {exc!r}")
@@ -705,6 +779,12 @@ def main():
                     "insert into fetch_log values (?, ?, ?, ?)",
                     (log_row["url"], log_row["fetched_at"], log_row["status"], log_row["error"]),
                 )
+                
+                # 5. COMMIT DB & QUEUE STATUS (Strict Transaction Ordering)
+                conn.execute(
+                    "UPDATE discoveries SET status = 'done', post_status = 'done', comment_status = ?, attempt_count = attempt_count + 1 WHERE post_id = ?",
+                    (comment_status, post_id)
+                )
                 conn.commit()
 
                 if jsonl_f:
@@ -715,7 +795,7 @@ def main():
 
                 print(f"[{index}/{len(items)}] saved post_id={post_id} comments={len(comments)} title={post['title']}")
 
-                # 5. EARLY VALIDATION (After 10 posts)
+                # 6. EARLY VALIDATION
                 if stats["post_saved"] == 10:
                     cursor = conn.execute("SELECT COUNT(*) FROM posts")
                     db_count = cursor.fetchone()[0]
@@ -724,10 +804,31 @@ def main():
                         raise SystemExit(f"Validation Failed! 10 posts processed but DB count is 0. Exiting.")
 
             except (TypeError, ValueError, AttributeError) as exc:
-                # Unexpected programming bug or structural DOM change -> Crash loud and fail-fast
                 import traceback
                 traceback.print_exc()
-                raise SystemExit(f"CRITICAL BUG: Unexpected error parsing post_id={post_id}. Exiting.")
+                print(f"Parse Error for post_id={post_id}. Error: {exc!r}")
+                conn.execute(
+                    "UPDATE discoveries SET attempt_count = attempt_count + 1, last_error = ? WHERE post_id = ?",
+                    (f"Parse Error: {exc!r}", post_id)
+                )
+                conn.execute(
+                    "UPDATE discoveries SET status = CASE WHEN attempt_count >= 3 THEN 'failed' ELSE 'discovered' END WHERE post_id = ?",
+                    (post_id,)
+                )
+                conn.commit()
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                print(f"Unexpected error processing post_id={post_id}: {exc!r}")
+                conn.execute(
+                    "UPDATE discoveries SET attempt_count = attempt_count + 1, last_error = ? WHERE post_id = ?",
+                    (f"General Error: {exc!r}", post_id)
+                )
+                conn.execute(
+                    "UPDATE discoveries SET status = CASE WHEN attempt_count >= 3 THEN 'failed' ELSE 'discovered' END WHERE post_id = ?",
+                    (post_id,)
+                )
+                conn.commit()
             
             polite_sleep(args.delay, args.jitter)
 
