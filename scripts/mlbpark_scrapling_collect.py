@@ -660,7 +660,9 @@ def main():
     )
     items = []
     for row in cur.fetchall():
-        items.append((row[0], {"url": row[1], "keywords": set(row[2].split(","))}))
+        post_id_val = row[0]
+        post_url = f"{BASE}?m=view&b=bullpen&id={post_id_val}"
+        items.append((post_id_val, {"url": post_url, "keywords": set(row[2].split(","))}))
         
     if args.limit_posts:
         items = items[: args.limit_posts]
@@ -699,6 +701,7 @@ def main():
                     stats["fetched"] += 1
                     consecutive_network_errors = 0
                 except RuntimeError as exc:
+                    conn.rollback()
                     print(f"Network error on {info['url']}: {exc}")
                     consecutive_network_errors += 1
                     
@@ -809,6 +812,7 @@ def main():
                         raise SystemExit(f"Validation Failed! 10 posts processed but DB count is 0. Exiting.")
 
             except (TypeError, ValueError, AttributeError) as exc:
+                conn.rollback()
                 import traceback
                 traceback.print_exc()
                 print(f"Parse Error for post_id={post_id}. Error: {exc!r}")
@@ -822,6 +826,7 @@ def main():
                 )
                 conn.commit()
             except Exception as exc:
+                conn.rollback()
                 import traceback
                 traceback.print_exc()
                 print(f"Unexpected error processing post_id={post_id}: {exc!r}")
