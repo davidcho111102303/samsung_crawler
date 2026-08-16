@@ -795,8 +795,13 @@ def main():
 
                 print(f"[{index}/{len(items)}] saved post_id={post_id} comments={len(comments)} title={post['title']}")
 
-                # 6. EARLY VALIDATION
-                if stats["post_saved"] == 10:
+                # 6. EARLY VALIDATION & CHAOS TEST
+                if stats["post_saved"] == 5 and os.environ.get("CHAOS_TEST"):
+                    import os as _os
+                    print("CHAOS TEST: 프로세스가 강제 종료(SIGKILL)되었습니다!")
+                    _os._exit(1)
+
+                if stats["post_saved"] == 10 and not os.environ.get("CHAOS_TEST"):
                     cursor = conn.execute("SELECT COUNT(*) FROM posts")
                     db_count = cursor.fetchone()[0]
                     print(f"Early Validation: {stats['post_saved']} posts saved in this run, DB currently has {db_count} posts total.")

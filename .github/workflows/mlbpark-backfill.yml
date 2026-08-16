@@ -55,6 +55,14 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Download previous progress artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: mlbpark-backfill.yml
+          name: mlbpark-progress
+          path: outputs/
+
       - name: Run MLBPARK crawler
         run: |
           mkdir -p outputs
