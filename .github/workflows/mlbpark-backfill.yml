@@ -10,15 +10,23 @@ on:
       end_date:
         description: End date, inclusive
         required: true
-        default: "2026-08-12"
+        default: "2026-08-17"
       keywords:
         description: Space-separated keywords
         required: true
-        default: "삼전 삼성전자 반도체 삼성"
-      max_search_pages:
-        description: Max MLBPARK search pages per keyword
+        default: "삼전 삼성전자 반도체 삼성 전자"
+      crawl_scope:
+        description: Stable resume-state scope; change it only for a new dataset definition
         required: true
-        default: "900"
+        default: "samsung-stock-2024-v3"
+      max_search_pages:
+        description: New MLBPARK search pages per keyword in this run
+        required: true
+        default: "20"
+      limit_posts:
+        description: Max queued posts processed in this run
+        required: true
+        default: "250"
       delay:
         description: Base delay seconds
         required: true
@@ -55,47 +63,56 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Download previous progress artifact
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          workflow: mlbpark-backfill.yml
-          name: mlbpark-progress
-          path: outputs/
+      - name: Validate required server credentials
+        run: |
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
 
       - name: Run MLBPARK crawler
         run: |
           mkdir -p outputs
           START_DATE="${{ github.event.inputs.start_date || '2024-01-01' }}"
-          END_DATE="${{ github.event.inputs.end_date || '2026-08-12' }}"
-          KEYWORDS="${{ github.event.inputs.keywords || '삼전 삼성전자 반도체 삼성' }}"
-          MAX_SEARCH_PAGES="${{ github.event.inputs.max_search_pages || '900' }}"
+          END_DATE="${{ github.event.inputs.end_date || '' }}"
+          if [ -z "$END_DATE" ]; then END_DATE="$(date -u +%F)"; fi
+          KEYWORDS="${{ github.event.inputs.keywords || '삼전 삼성전자 반도체 삼성 전자' }}"
+          CRAWL_SCOPE="${{ github.event.inputs.crawl_scope || 'samsung-stock-2024-v3' }}"
+          MAX_SEARCH_PAGES="${{ github.event.inputs.max_search_pages || '20' }}"
+          LIMIT_POSTS="${{ github.event.inputs.limit_posts || '250' }}"
           DELAY="${{ github.event.inputs.delay || '2.0' }}"
           JITTER="${{ github.event.inputs.jitter || '3.0' }}"
 
           python scripts/mlbpark_scrapling_collect.py \
-            --db outputs/mlbpark-progress.sqlite \
-            --jsonl outputs/mlbpark-posts.jsonl \
+            --db outputs/mlbpark-stock-samsung-v3.sqlite \
+            --jsonl outputs/mlbpark-stock-samsung-v3.jsonl \
+            --crawl-scope "$CRAWL_SCOPE" \
             --start-date "$START_DATE" \
             --end-date "$END_DATE" \
             --keywords $KEYWORDS \
             --max-search-pages "$MAX_SEARCH_PAGES" \
+            --limit-posts "$LIMIT_POSTS" \
             --delay "$DELAY" \
             --jitter "$JITTER" \
-            --timeout 30 \
             --retries 3 \
             --backoff 30 \
-            --stop-after-older-pages 4 \
-            --supabase-storage-bucket mlbpark-raw \
-            --supabase-storage-prefix mlbpark/samsung \
+            --timeout 30 \
+            --required-category "주식" \
+            --supabase-storage-bucket "mlbpark-raw" \
+            --supabase-storage-prefix "mlbpark/samsung" \
             --no-local-raw-html
+
+      - name: Validate local dataset invariants
+        if: always()
+        run: |
+          if [ -f outputs/mlbpark-stock-samsung-v3.sqlite ]; then
+            python scripts/validate_dataset.py outputs/mlbpark-stock-samsung-v3.sqlite
+          fi
 
       - name: Upload progress artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlbpark-progress
+          name: mlbpark-stock-samsung-v3-debug-${{ github.run_id }}
           path: |
-            outputs/mlbpark-progress.sqlite
-            outputs/mlbpark-posts.jsonl
+            outputs/mlbpark-stock-samsung-v3.sqlite
+            outputs/mlbpark-stock-samsung-v3.jsonl
           retention-days: 7
