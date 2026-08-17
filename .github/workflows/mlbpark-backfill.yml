@@ -22,11 +22,11 @@ on:
       max_search_pages:
         description: New MLBPARK search pages per keyword in this run
         required: true
-        default: "20"
+        default: "100"
       limit_posts:
         description: Max queued posts processed in this run
         required: true
-        default: "250"
+        default: "700"
       delay:
         description: Base delay seconds
         required: true
@@ -36,8 +36,8 @@ on:
         required: true
         default: "2.2"
   schedule:
-    # Small nightly catch-up. Manual workflow_dispatch is recommended for heavy backfill.
-    - cron: "30 18 * * *"
+    # Durable queue/cursor state makes each bounded run continue the same backfill.
+    - cron: "17 */6 * * *"
 
 concurrency:
   group: mlbpark-samsung-backfill
@@ -77,8 +77,8 @@ jobs:
           if [ -z "$END_DATE" ]; then END_DATE="$(date -u +%F)"; fi
           KEYWORDS="${{ github.event.inputs.keywords || '삼전 삼성전자 반도체 삼성 전자' }}"
           CRAWL_SCOPE="${{ github.event.inputs.crawl_scope || 'samsung-stock-2024-v3' }}"
-          MAX_SEARCH_PAGES="${{ github.event.inputs.max_search_pages || '20' }}"
-          LIMIT_POSTS="${{ github.event.inputs.limit_posts || '250' }}"
+          MAX_SEARCH_PAGES="${{ github.event.inputs.max_search_pages || '100' }}"
+          LIMIT_POSTS="${{ github.event.inputs.limit_posts || '700' }}"
           DELAY="${{ github.event.inputs.delay || '2.0' }}"
           JITTER="${{ github.event.inputs.jitter || '3.0' }}"
 
