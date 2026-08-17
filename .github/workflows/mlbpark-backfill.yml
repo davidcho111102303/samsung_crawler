@@ -41,7 +41,8 @@ on:
 
 concurrency:
   group: mlbpark-samsung-backfill
-  cancel-in-progress: false
+  # A newly dispatched crawler revision supersedes a stale/older runner.
+  cancel-in-progress: true
 
 jobs:
   backfill:
